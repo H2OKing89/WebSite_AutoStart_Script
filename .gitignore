@@ -138,6 +138,12 @@ venv.bak/
 # mkdocs documentation
 /site
 
+######################
+run_screenshot_script.bat
+config.yaml
+logs/
+######################
+
 # mypy
 .mypy_cache/
 .dmypy.json
