@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Script Name: Website Screenshot Taker
-Version: 1.0.7
+Version: 1.0.8
 Author: Quentin King
 Date: 09-21-2024
 
@@ -14,12 +14,17 @@ and a graceful shutdown mechanism. Additionally, it enhances logging, handles fa
 and tracks detailed performance metrics.
 
 Changelog:
+- Version 1.0.8: Implemented dynamic Chrome version detection and Chromedriver installation.
+                 Fixed logging KeyError by renaming 'message' in 'extra' dictionaries.
+                 Improved error handling and notifications.
+                 Updated version control information.
 - Version 1.0.7: Implemented ThreadPoolExecutor with dynamic worker count based on CPU cores.
                  Added signal handling for graceful shutdown with cleanup.
                  Enhanced performance metrics tracking and error handling.
                  Improved logging with JSON formatting and error details.
                  Redirected tqdm output to a log file in headless mode.
                  Updated documentation and comments for clarity.
+                 Added dynamic worker count based on CPU cores.
 - Version 1.0.6: Implemented fallback directories relative to the script's location.
                  Added specific exception handling.
                  Optimized resource monitoring using deque.
@@ -42,6 +47,7 @@ import threading
 import random
 import functools
 import signal
+import subprocess
 from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont
 from selenium import webdriver
@@ -125,7 +131,7 @@ def setup_logging(log_dir, debug_mode):
     file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5)
     file_handler.setLevel(logging.DEBUG if debug_mode else logging.INFO)
     file_formatter = jsonlogger.JsonFormatter(
-        '%(asctime)s %(levelname)s %(name)s %(message)s %(site)s %(status)s'
+        '%(asctime)s %(levelname)s %(name)s %(notification_message)s %(title)s %(action)s'
     )
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
@@ -171,16 +177,16 @@ def send_pushover_notification(message, title="Website Screenshot Script"):
         "html": 1,  # Enable HTML formatting
     }
 
-    logger.info("Sending Pushover notification...", extra={"message": message, "title": title, "action": "send_pushover"})
+    logger.info("Sending Pushover notification...", extra={"notification_message": message, "title": title, "action": "send_pushover"})
 
     try:
         response = requests.post("https://api.pushover.net/1/messages.json", data=payload)
         if response.status_code == 200:
-            logger.info("Pushover notification sent successfully!", extra={"status": "success", "action": "send_pushover"})
+            logger.info("Pushover notification sent successfully!", extra={"notification_message": "Pushover notification sent successfully!", "title": title, "action": "send_pushover"})
         else:
-            logger.error(f"Pushover failed. Status code: {response.status_code}, Response: {response.text}", extra={"status": "failure", "action": "send_pushover"})
+            logger.error(f"Pushover failed. Status code: {response.status_code}, Response: {response.text}", extra={"notification_message": f"Pushover failed with status code {response.status_code}", "title": title, "action": "send_pushover"})
     except Exception as e:
-        logger.error(f"Error sending Pushover notification: {e}", exc_info=True, extra={"status": "error", "action": "send_pushover"})
+        logger.error(f"Error sending Pushover notification: {e}", exc_info=True, extra={"notification_message": f"Error sending Pushover notification: {e}", "title": title, "action": "send_pushover"})
 
 def ensure_directory(path, fallback_subdir):
     """
@@ -195,7 +201,7 @@ def ensure_directory(path, fallback_subdir):
     """
     if not os.path.exists(path):
         fallback_path = os.path.join(script_dir, fallback_subdir)
-        logger.warning(f"Directory {path} does not exist. Using fallback: {fallback_path}", extra={"path": path, "fallback_path": fallback_path, "action": "ensure_directory"})
+        logger.warning(f"Directory {path} does not exist. Using fallback: {fallback_path}", extra={"notification_message": f"Directory {path} does not exist. Using fallback: {fallback_path}", "title": "Directory Warning", "action": "ensure_directory"})
         send_pushover_notification(f"Directory {path} not found. Falling back to {fallback_path}.", title="Directory Fallback")
         os.makedirs(fallback_path, exist_ok=True)
         return fallback_path
@@ -227,7 +233,7 @@ def monitor_resources():
         net_sent_bytes.append(net_io.bytes_sent)
         net_recv_bytes.append(net_io.bytes_recv)
         time.sleep(5)
-    logger.info("Resource monitor thread exiting due to resource_monitor_event.", extra={"action": "monitor_resources"})
+    logger.info("Resource monitor thread exiting due to resource_monitor_event.", extra={"notification_message": "Resource monitor thread exiting due to resource_monitor_event.", "title": "Resource Monitor", "action": "monitor_resources"})
 
 def retry(exceptions, total_tries=4, initial_wait=0.5, backoff_factor=2):
     """
@@ -251,14 +257,18 @@ def retry(exceptions, total_tries=4, initial_wait=0.5, backoff_factor=2):
                     return func(*args, **kwargs)
                 except exceptions as e:
                     if shutdown_event.is_set():
-                        logger.info(f"Shutdown event detected during retries. Exiting {func.__name__}.", extra={"function": func.__name__, "action": "retry"})
+                        logger.info(f"Shutdown event detected during retries. Exiting {func.__name__}.", extra={"notification_message": f"Shutdown event detected during retries in {func.__name__}.", "title": "Retry Shutdown", "action": "retry"})
                         raise e
                     msg = f"{func.__name__} failed with {e}, retrying in {_delay} seconds..."
-                    logger.warning(msg, extra={"function": func.__name__, "exception": str(e), "action": "retry"})
+                    logger.warning(msg, extra={"notification_message": msg, "title": "Retry Warning", "action": "retry"})
                     time.sleep(_delay)
                     _tries -= 1
                     _delay *= backoff_factor
-            return func(*args, **kwargs)
+            try:
+                return func(*args, **kwargs)
+            except exceptions as e:
+                logger.error(f"All retries exhausted for {func.__name__}.", exc_info=True, extra={"notification_message": f"All retries exhausted for {func.__name__}.", "title": "Retry Exhausted", "action": "retry"})
+                raise e
         return wrapper_retry
     return decorator_retry
 
@@ -295,9 +305,9 @@ def add_timestamp_to_image(image_path):
         combined = Image.alpha_composite(img, txt_layer)
         combined = combined.convert('RGB')  # Convert back to RGB
         combined.save(image_path, format='PNG', optimize=True)
-        logger.info(f"Timestamp added to image: {image_path}", extra={"image_path": image_path, "action": "add_timestamp"})
+        logger.info(f"Timestamp added to image: {image_path}", extra={"notification_message": f"Timestamp added to image: {image_path}", "title": "Timestamp Added", "action": "add_timestamp"})
     except Exception as e:
-        logger.error(f"Failed to add timestamp to image {image_path}: {e}", exc_info=True, extra={"image_path": image_path, "action": "add_timestamp"})
+        logger.error(f"Failed to add timestamp to image {image_path}: {e}", exc_info=True, extra={"notification_message": f"Failed to add timestamp to image {image_path}: {e}", "title": "Timestamp Error", "action": "add_timestamp"})
 
 @retry((Exception,), total_tries=3, initial_wait=2, backoff_factor=2)
 def take_fullpage_screenshot(driver, site_name, status):
@@ -313,7 +323,7 @@ def take_fullpage_screenshot(driver, site_name, status):
         str: Path to the saved screenshot.
     """
     if shutdown_event.is_set():
-        logger.info("Shutdown event detected. Skipping screenshot.", extra={"site": site_name, "action": "take_fullpage_screenshot"})
+        logger.info("Shutdown event detected. Skipping screenshot.", extra={"notification_message": f"Shutdown detected. Skipping screenshot for {site_name}.", "title": "Shutdown Skipped", "action": "take_fullpage_screenshot"})
         raise Exception("Shutdown event detected.")
     try:
         # Clean site name for filename
@@ -331,10 +341,10 @@ def take_fullpage_screenshot(driver, site_name, status):
         # Take screenshot of the viewport
         driver.save_screenshot(screenshot_path)
         add_timestamp_to_image(screenshot_path)
-        logger.info(f"Screenshot saved: {screenshot_path}", extra={"site": site_name, "screenshot_path": screenshot_path, "action": "take_fullpage_screenshot"})
+        logger.info(f"Screenshot saved: {screenshot_path}", extra={"notification_message": f"Screenshot saved: {screenshot_path}", "title": "Screenshot Saved", "action": "take_fullpage_screenshot"})
         return screenshot_path
     except Exception as e:
-        logger.error(f"Failed to take screenshot for {site_name}: {e}", exc_info=True, extra={"site": site_name, "action": "take_fullpage_screenshot"})
+        logger.error(f"Failed to take screenshot for {site_name}: {e}", exc_info=True, extra={"notification_message": f"Failed to take screenshot for {site_name}: {e}", "title": "Screenshot Error", "action": "take_fullpage_screenshot"})
         raise e
 
 def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
@@ -358,7 +368,7 @@ def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
                 images.append(img)
 
         if not images:
-            logger.warning("No images found to combine.", extra={"action": "combine_images"})
+            logger.warning("No images found to combine.", extra={"notification_message": "No images found to combine.", "title": "Combine Images Warning", "action": "combine_images"})
             return None
 
         # Resize images to the desired resolution
@@ -383,10 +393,10 @@ def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
         combined_image_path = os.path.join(screenshot_dir, combined_image_name)
         # Optimize image to reduce file size
         grid_image.save(combined_image_path, format='PNG', optimize=True)
-        logger.info(f"Combined image saved: {combined_image_path}", extra={"combined_image_path": combined_image_path, "action": "combine_images"})
+        logger.info(f"Combined image saved: {combined_image_path}", extra={"notification_message": f"Combined image saved: {combined_image_path}", "title": "Combine Images", "action": "combine_images"})
         return combined_image_path
     except Exception as e:
-        logger.error(f"Failed to combine images into grid: {e}", exc_info=True, extra={"action": "combine_images"})
+        logger.error(f"Failed to combine images into grid: {e}", exc_info=True, extra={"notification_message": f"Failed to combine images into grid: {e}", "title": "Combine Images Error", "action": "combine_images"})
         return None
 
 def archive_old_screenshots():
@@ -402,7 +412,7 @@ def archive_old_screenshots():
         for filename in os.listdir(config.screenshot_dir):
             if filename.endswith('.png'):
                 shutil.move(os.path.join(config.screenshot_dir, filename), os.path.join(archive_subdir, filename))
-        logger.info(f"Old screenshots moved to {archive_subdir}", extra={"archive_subdir": archive_subdir, "action": "archive_old_screenshots"})
+        logger.info(f"Old screenshots moved to {archive_subdir}", extra={"notification_message": f"Old screenshots moved to {archive_subdir}", "title": "Archive Screenshots", "action": "archive_old_screenshots"})
 
         # Cleanup old archives, keep only the 5 most recent
         archives = sorted(os.listdir(config.archive_dir), reverse=True)
@@ -411,9 +421,9 @@ def archive_old_screenshots():
             for archive in archives_to_delete:
                 archive_path = os.path.join(config.archive_dir, archive)
                 shutil.rmtree(archive_path)
-                logger.info(f"Deleted old archive: {archive_path}", extra={"archive_path": archive_path, "action": "cleanup_archive"})
+                logger.info(f"Deleted old archive: {archive_path}", extra={"notification_message": f"Deleted old archive: {archive_path}", "title": "Cleanup Archive", "action": "cleanup_archive"})
     except Exception as e:
-        logger.error(f"Failed to archive old screenshots: {e}", exc_info=True, extra={"action": "archive_old_screenshots"})
+        logger.error(f"Failed to archive old screenshots: {e}", exc_info=True, extra={"notification_message": f"Failed to archive old screenshots: {e}", "title": "Archive Error", "action": "archive_old_screenshots"})
 
 @retry((Exception,), total_tries=3, initial_wait=2, backoff_factor=2)
 def upload_to_ftp(file_path):
@@ -427,7 +437,7 @@ def upload_to_ftp(file_path):
         bool: True if upload succeeded, False otherwise.
     """
     if shutdown_signal_received:
-        logger.info("Shutdown signal received. Skipping FTP upload.", extra={"action": "upload_to_ftp"})
+        logger.info("Shutdown signal received. Skipping FTP upload.", extra={"notification_message": "Shutdown signal received. Skipping FTP upload.", "title": "FTP Upload Skipped", "action": "upload_to_ftp"})
         raise Exception("Shutdown event detected.")
     try:
         with ftplib.FTP() as ftp:
@@ -448,18 +458,18 @@ def upload_to_ftp(file_path):
                 if f.lower().endswith(('.png', '.jpg', '.jpeg')):
                     try:
                         ftp.delete(f)
-                        logger.info(f"Deleted existing file: {f}", extra={"file": f, "action": "ftp_delete"})
+                        logger.info(f"Deleted existing file: {f}", extra={"notification_message": f"Deleted existing file: {f}", "title": "FTP Delete", "action": "ftp_delete"})
                     except ftplib.error_perm as e:
-                        logger.warning(f"Could not delete file {f}: {e}", extra={"file": f, "action": "ftp_delete", "error": str(e)})
+                        logger.warning(f"Could not delete file {f}: {e}", extra={"notification_message": f"Could not delete file {f}: {e}", "title": "FTP Delete Warning", "action": "ftp_delete", "error": str(e)})
 
             # Upload the new file
             filename = os.path.basename(file_path)
             with open(file_path, 'rb') as file:
                 ftp.storbinary(f'STOR {filename}', file)
-            logger.info(f"Uploaded {filename} to FTP successfully", extra={"file": filename, "action": "ftp_upload"})
+            logger.info(f"Uploaded {filename} to FTP successfully", extra={"notification_message": f"Uploaded {filename} to FTP successfully", "title": "FTP Upload", "action": "ftp_upload"})
             return True
     except Exception as e:
-        logger.error(f"FTP upload failed: {e}", exc_info=True, extra={"action": "upload_to_ftp"})
+        logger.error(f"FTP upload failed: {e}", exc_info=True, extra={"notification_message": f"FTP upload failed: {e}", "title": "FTP Upload Error", "action": "upload_to_ftp"})
         send_pushover_notification(f"FTP upload failed: {e}", title="FTP Upload Error")
         raise e
 
@@ -480,7 +490,7 @@ def wait_for_page_load(driver, timeout=60):
             lambda d: d.execute_script('return document.readyState') == 'complete' or shutdown_event.is_set()
         )
     except TimeoutException:
-        logger.warning(f"Timeout waiting for page to load after {timeout} seconds.", extra={"action": "wait_for_page_load"})
+        logger.warning(f"Timeout waiting for page to load after {timeout} seconds.", extra={"notification_message": f"Timeout waiting for page to load after {timeout} seconds.", "title": "Page Load Timeout", "action": "wait_for_page_load"})
         return False
     return True
 
@@ -498,7 +508,7 @@ def load_website_with_retry(driver, site, timeout=60):
         bool: True if website loaded successfully, False otherwise.
     """
     if shutdown_event.is_set():
-        logger.info("Shutdown event detected. Skipping website load.", extra={"site": site, "action": "load_website_with_retry"})
+        logger.info("Shutdown event detected. Skipping website load.", extra={"notification_message": f"Shutdown detected. Skipping website load for {site}.", "title": "Website Load Skipped", "action": "load_website_with_retry"})
         raise Exception("Shutdown event detected.")
     try:
         driver.get(site)
@@ -506,7 +516,7 @@ def load_website_with_retry(driver, site, timeout=60):
             raise TimeoutException("Page did not load in time.")
         return True
     except (TimeoutException, WebDriverException) as e:
-        logger.warning(f"Failed to load {site}: {e}", extra={"site": site, "action": "load_website_with_retry"})
+        logger.warning(f"Failed to load {site}: {e}", extra={"notification_message": f"Failed to load {site}: {e}", "title": "Website Load Warning", "action": "load_website_with_retry"})
         raise e
 
 def clean_temporary_files():
@@ -516,9 +526,9 @@ def clean_temporary_files():
     try:
         shutil.rmtree(config.screenshot_dir, ignore_errors=True)
         os.makedirs(config.screenshot_dir, exist_ok=True)
-        logger.info("Temporary files cleaned up.", extra={"action": "clean_temporary_files"})
+        logger.info("Temporary files cleaned up.", extra={"notification_message": "Temporary files cleaned up.", "title": "Cleanup", "action": "clean_temporary_files"})
     except Exception as e:
-        logger.error(f"Failed to clean temporary files: {e}", exc_info=True, extra={"action": "clean_temporary_files"})
+        logger.error(f"Failed to clean temporary files: {e}", exc_info=True, extra={"notification_message": f"Failed to clean temporary files: {e}", "title": "Cleanup Error", "action": "clean_temporary_files"})
 
 def process_site(driver, site, start_time):
     """
@@ -533,7 +543,7 @@ def process_site(driver, site, start_time):
         None
     """
     if shutdown_event.is_set():
-        logger.info(f"Shutdown event detected before processing {site}. Skipping.", extra={"site": site, "action": "process_site"})
+        logger.info(f"Shutdown event detected before processing {site}. Skipping.", extra={"notification_message": f"Shutdown detected. Skipping processing for {site}.", "title": "Process Skipped", "action": "process_site"})
         return
     site_start_time = datetime.now()
     screenshot_capture_time = None
@@ -543,7 +553,7 @@ def process_site(driver, site, start_time):
         if success:
             # Additional delay to ensure all content is loaded
             total_delay = 7  # Existing 5 seconds + extra 2 seconds
-            logger.info(f"Waiting an additional {total_delay} seconds for {site} to load fully.", extra={"site": site, "delay_seconds": total_delay, "action": "process_site"})
+            logger.info(f"Waiting an additional {total_delay} seconds for {site} to load fully.", extra={"notification_message": f"Waiting an additional {total_delay} seconds for {site} to load fully.", "title": "Additional Delay", "action": "process_site"})
             time.sleep(total_delay)
 
         # Track screenshot capture time
@@ -556,33 +566,70 @@ def process_site(driver, site, start_time):
             raise Exception("Failed to load the page successfully.")
 
         successful_sites.append(site)
-        logger.info(f"Successfully processed {site} in {screenshot_capture_time:.2f} seconds.", extra={"site": site, "capture_time": screenshot_capture_time, "status": "success"})
+        logger.info(f"Successfully processed {site} in {screenshot_capture_time:.2f} seconds.", extra={"notification_message": f"Successfully processed {site} in {screenshot_capture_time:.2f} seconds.", "title": "Process Success", "action": "process_site"})
 
     except Exception as e:
-        logger.error(f"Error processing {site}: {e}", exc_info=True, extra={"site": site, "action": "process_site"})
+        logger.error(f"Error processing {site}: {e}", exc_info=True, extra={"notification_message": f"Error processing {site}: {e}", "title": "Process Error", "action": "process_site"})
         failed_sites[site] = str(e)
     finally:
         site_end_time = datetime.now()
         site_duration = site_end_time - site_start_time
-        logger.info(f"Time taken for {site}: {site_duration}", extra={"site": site, "duration": str(site_duration), "action": "process_site"})
+        logger.info(f"Time taken for {site}: {site_duration}", extra={"notification_message": f"Time taken for {site}: {site_duration}", "title": "Process Duration", "action": "process_site"})
         if not shutdown_event.is_set():
             # Simulate network latency measurement
             network_latency = random.uniform(50, 150)  # Placeholder for actual latency measurement
-            logger.info(f"Network latency for {site}: {network_latency:.2f} ms", extra={"site": site, "network_latency_ms": network_latency, "action": "process_site"})
+            logger.info(f"Network latency for {site}: {network_latency:.2f} ms", extra={"notification_message": f"Network latency for {site}: {network_latency:.2f} ms", "title": "Network Latency", "action": "process_site"})
             # Randomly simulate network latency for demonstration
             time.sleep(random.uniform(1, 3))
 
+def get_chrome_version():
+    """
+    Retrieves the installed Google Chrome version.
+
+    Returns:
+        str: The major version number of Chrome (e.g., '128').
+             Returns None if Chrome is not found or an error occurs.
+    """
+    try:
+        # Attempt to find the path to chrome.exe using 'where' command on Windows
+        result = subprocess.run(['where', 'chrome'], capture_output=True, text=True, check=True)
+        chrome_path = result.stdout.strip().split('\n')[0]  # Get the first path
+    except subprocess.CalledProcessError:
+        # Chrome not found in PATH
+        logger.error("Google Chrome executable not found in PATH.", extra={"notification_message": "Google Chrome executable not found in PATH.", "title": "Chrome Not Found", "action": "get_chrome_version"})
+        return None
+
+    try:
+        # Get the version of Chrome by executing 'chrome.exe --version'
+        version_result = subprocess.run([chrome_path, '--version'], capture_output=True, text=True, check=True)
+        version_str = version_result.stdout.strip()
+        # Example output: "Google Chrome 128.0.6613.90"
+        major_version = version_str.split(' ')[-1].split('.')[0]
+        logger.info(f"Detected Google Chrome version: {major_version}", extra={"notification_message": f"Detected Google Chrome version: {major_version}", "title": "Chrome Version", "action": "get_chrome_version"})
+        return major_version
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to retrieve Chrome version: {e}", extra={"notification_message": f"Failed to retrieve Chrome version: {e}", "title": "Chrome Version Error", "action": "get_chrome_version"})
+        return None
+
 def initialize_webdriver():
     """
-    Initialize the Selenium WebDriver with options.
+    Initialize the Selenium WebDriver with options, ensuring the ChromeDriver version matches the installed Chrome browser.
 
     Returns:
         WebDriver: Selenium WebDriver instance.
     """
     if shutdown_event.is_set():
-        logger.info("Shutdown event detected. Skipping WebDriver initialization.", extra={"action": "initialize_webdriver"})
+        logger.info("Shutdown event detected. Skipping WebDriver initialization.", extra={"notification_message": "Shutdown event detected. Skipping WebDriver initialization.", "title": "WebDriver Initialization Skipped", "action": "initialize_webdriver"})
         raise Exception("Shutdown event detected.")
     try:
+        # Detect Chrome version
+        chrome_version = get_chrome_version()
+        if not chrome_version:
+            raise Exception("Could not detect Google Chrome version.")
+
+        # Initialize WebDriverManager with the detected Chrome version
+        driver_path = ChromeDriverManager(version=chrome_version).install()
+
         options = webdriver.ChromeOptions()
         profile_path = config.profile_path
         options.add_argument(f"--user-data-dir={profile_path}")
@@ -604,19 +651,19 @@ def initialize_webdriver():
         # Set page load strategy to 'normal' to wait for all resources
         options.page_load_strategy = 'normal'
 
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        logger.info("WebDriver initialized successfully.", extra={"action": "initialize_webdriver"})
+        driver = webdriver.Chrome(service=Service(driver_path), options=options)
+        logger.info("WebDriver initialized successfully.", extra={"notification_message": "WebDriver initialized successfully.", "title": "WebDriver Initialized", "action": "initialize_webdriver"})
         return driver
     except SessionNotCreatedException as e:
-        logger.error(f"WebDriver session not created: {e}", exc_info=True, extra={"action": "initialize_webdriver"})
+        logger.error(f"WebDriver session not created: {e}", exc_info=True, extra={"notification_message": f"WebDriver session not created: {e}", "title": "WebDriver Error", "action": "initialize_webdriver"})
         send_pushover_notification(f"WebDriver session not created: {e}", title="WebDriver Error")
         raise e
     except WebDriverException as e:
-        logger.error(f"Failed to initialize WebDriver: {e}", exc_info=True, extra={"action": "initialize_webdriver"})
+        logger.error(f"Failed to initialize WebDriver: {e}", exc_info=True, extra={"notification_message": f"Failed to initialize WebDriver: {e}", "title": "WebDriver Error", "action": "initialize_webdriver"})
         send_pushover_notification(f"Failed to initialize WebDriver: {e}", title="WebDriver Error")
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error during WebDriver initialization: {e}", exc_info=True, extra={"action": "initialize_webdriver"})
+        logger.error(f"Unexpected error during WebDriver initialization: {e}", exc_info=True, extra={"notification_message": f"Unexpected error during WebDriver initialization: {e}", "title": "WebDriver Error", "action": "initialize_webdriver"})
         send_pushover_notification(f"Unexpected error during WebDriver initialization: {e}", title="WebDriver Error")
         raise e
 
@@ -633,7 +680,7 @@ def handle_shutdown_signal(signum, frame):
         frame (frame): Current stack frame.
     """
     global shutdown_signal_received
-    logger.info(f"Received shutdown signal ({signum}). Initiating graceful shutdown...", extra={"signal_number": signum, "action": "shutdown"})
+    logger.info(f"Received shutdown signal ({signum}). Initiating graceful shutdown...", extra={"notification_message": f"Received shutdown signal ({signum}). Initiating graceful shutdown...", "title": "Shutdown Initiated", "action": "shutdown"})
     shutdown_signal_received = True
     shutdown_event.set()
     resource_monitor_event.set()
@@ -653,7 +700,7 @@ def main():
     global combined_image_path
 
     start_time = datetime.now()
-    logger.info(f"Script started at {start_time}", extra={"action": "start_script"})
+    logger.info(f"Script started at {start_time}", extra={"notification_message": f"Script started at {start_time}", "title": "Script Start", "action": "start_script"})
 
     # Record initial Disk I/O and Network I/O counters
     initial_disk_io = psutil.disk_io_counters()
@@ -678,7 +725,7 @@ def main():
         if is_headless:
             tqdm_log_path = os.path.join(config.log_dir, 'tqdm_output.log')
             tqdm_file = open(tqdm_log_path, 'a')  # Append mode
-            logger.info(f"tqdm output redirected to {tqdm_log_path}", extra={"action": "tqdm_redirect"})
+            logger.info(f"tqdm output redirected to {tqdm_log_path}", extra={"notification_message": f"tqdm output redirected to {tqdm_log_path}", "title": "tqdm Redirected", "action": "tqdm_redirect"})
         else:
             tqdm_file = sys.stdout
 
@@ -694,16 +741,16 @@ def main():
                 try:
                     future.result()
                 except Exception as e:
-                    logger.error(f"Error processing {site}: {e}", exc_info=True, extra={"site": site, "action": "process_site_async"})
+                    logger.error(f"Error processing {site}: {e}", exc_info=True, extra={"notification_message": f"Error processing {site}: {e}", "title": "Processing Error", "action": "process_site_async"})
 
         if is_headless:
             tqdm_file.close()
 
     except Exception as e:
         if shutdown_event.is_set():
-            logger.info("Shutdown event detected during main execution.", extra={"action": "main_exception"})
+            logger.info("Shutdown event detected during main execution.", extra={"notification_message": "Shutdown event detected during main execution.", "title": "Main Shutdown", "action": "main_exception"})
         else:
-            logger.error(f"An unexpected error occurred in main: {e}", exc_info=True, extra={"action": "main_exception"})
+            logger.error(f"An unexpected error occurred in main: {e}", exc_info=True, extra={"notification_message": f"An unexpected error occurred in main: {e}", "title": "Main Error", "action": "main_exception"})
     finally:
         # Signal the resource monitor thread to stop
         resource_monitor_event.set()
@@ -711,9 +758,9 @@ def main():
         if driver:
             try:
                 driver.quit()
-                logger.info("WebDriver quit successfully.", extra={"action": "quit_webdriver"})
+                logger.info("WebDriver quit successfully.", extra={"notification_message": "WebDriver quit successfully.", "title": "WebDriver Quit", "action": "quit_webdriver"})
             except Exception as e:
-                logger.error(f"Failed to quit WebDriver: {e}", exc_info=True, extra={"action": "quit_webdriver"})
+                logger.error(f"Failed to quit WebDriver: {e}", exc_info=True, extra={"notification_message": f"Failed to quit WebDriver: {e}", "title": "WebDriver Quit Error", "action": "quit_webdriver"})
 
         end_time = datetime.now()
         total_time = end_time - start_time
@@ -751,7 +798,7 @@ def main():
                     # Construct the URL to access the image
                     combined_image_url = f"{base_url}{os.path.basename(combined_image_path)}"
                 except Exception as e:
-                    logger.error(f"Error during FTP upload: {e}", exc_info=True, extra={"action": "upload_to_ftp"})
+                    logger.error(f"Error during FTP upload: {e}", exc_info=True, extra={"notification_message": f"Error during FTP upload: {e}", "title": "FTP Upload Error", "action": "upload_to_ftp"})
                     error_details = f"FTP upload failed: {e}"
                     error_occurred = True
             else:
@@ -807,7 +854,7 @@ def main():
         # Clean up temporary files
         clean_temporary_files()
 
-        logger.info(f"Script completed at {end_time}, Total time: {total_time}", extra={"action": "end_script"})
+        logger.info(f"Script completed at {end_time}, Total time: {total_time}", extra={"notification_message": f"Script completed at {end_time}, Total time: {total_time}", "title": "Script Completion", "action": "end_script"})
         print(f"Total time taken: {total_time}")
 
 # =============================================================================
@@ -891,7 +938,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received. Initiating graceful shutdown...", extra={"action": "keyboard_interrupt"})
+        logger.info("KeyboardInterrupt received. Initiating graceful shutdown...", extra={"notification_message": "KeyboardInterrupt received. Initiating graceful shutdown...", "title": "KeyboardInterrupt", "action": "keyboard_interrupt"})
         shutdown_signal_received = True
         shutdown_event.set()
         resource_monitor_event.set()
