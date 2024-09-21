@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Script Name: Website Screenshot Taker
-Version: 1.0.6
+Version: 1.0.7
 Author: Quentin King
 Date: 09-21-2024
 
@@ -14,6 +14,12 @@ and a graceful shutdown mechanism. Additionally, it enhances logging, handles fa
 and tracks detailed performance metrics.
 
 Changelog:
+- Version 1.0.7: Implemented ThreadPoolExecutor with dynamic worker count based on CPU cores.
+                 Added signal handling for graceful shutdown with cleanup.
+                 Enhanced performance metrics tracking and error handling.
+                 Improved logging with JSON formatting and error details.
+                 Redirected tqdm output to a log file in headless mode.
+                 Updated documentation and comments for clarity.
 - Version 1.0.6: Implemented fallback directories relative to the script's location.
                  Added specific exception handling.
                  Optimized resource monitoring using deque.
@@ -56,7 +62,7 @@ from tqdm import tqdm
 import logging
 from logging.handlers import RotatingFileHandler
 from pythonjsonlogger import jsonlogger
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, validator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import sys
@@ -77,13 +83,13 @@ class Config(BaseModel):
     window_size: dict
     max_workers: int = 5
 
-    @field_validator('grid_size')
+    @validator('grid_size')
     def check_grid_size(cls, v):
         if 'rows' not in v or 'columns' not in v:
             raise ValueError("Grid size must include 'rows' and 'columns'")
         return v
 
-    @field_validator('window_size')
+    @validator('window_size')
     def check_window_size(cls, v):
         if 'width' not in v or 'height' not in v:
             raise ValueError("Window size must include 'width' and 'height'")
