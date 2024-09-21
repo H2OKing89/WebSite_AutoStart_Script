@@ -56,7 +56,7 @@ from tqdm import tqdm
 import logging
 from logging.handlers import RotatingFileHandler
 from pythonjsonlogger import jsonlogger
-from pydantic import BaseModel, ValidationError, field_validator  # Updated import
+from pydantic import BaseModel, ValidationError, field_validator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import sys
@@ -317,7 +317,7 @@ def take_fullpage_screenshot(driver, site_name, status):
         screenshot_path = os.path.join(config.screenshot_dir, screenshot_name)
 
         # Set window size to desired resolution
-        driver.set_window_size(*window_size)
+        driver.set_window_size(config.window_size["width"], config.window_size["height"])
 
         # Wait for page to load completely
         wait_for_page_load(driver)
@@ -356,19 +356,19 @@ def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
             return None
 
         # Resize images to the desired resolution
-        images = [img.resize((window_size["width"], window_size["height"])) for img in images]
+        images = [img.resize((config.window_size["width"], config.window_size["height"])) for img in images]
 
         # Calculate grid size
         grid_rows, grid_columns = grid_size
-        grid_width = grid_columns * window_size["width"]
-        grid_height = grid_rows * window_size["height"]
+        grid_width = grid_columns * config.window_size["width"]
+        grid_height = grid_rows * config.window_size["height"]
 
         # Create the combined grid image
         grid_image = Image.new('RGB', (grid_width, grid_height), color=(255, 255, 255))
 
         for idx, img in enumerate(images):
-            x = (idx % grid_columns) * window_size["width"]
-            y = (idx // grid_columns) * window_size["height"]
+            x = (idx % grid_columns) * config.window_size["width"]
+            y = (idx // grid_columns) * config.window_size["height"]
             grid_image.paste(img, (x, y))
 
         # Rename combined image with timestamp
@@ -804,93 +804,84 @@ def main():
         logger.info(f"Script completed at {end_time}, Total time: {total_time}", extra={"action": "end_script"})
         print(f"Total time taken: {total_time}")
 
+# =============================================================================
+# Global Variables for Resource Monitoring and Shutdown
+# =============================================================================
+
+# Get the directory where the script is located
+script_dir = get_script_directory()
+
+# Load environment variables from .env file
+dotenv_path = os.path.join(script_dir, '.env')
+load_dotenv(dotenv_path)
+
+# Load configuration from config.yaml
+config_path = os.path.join(script_dir, 'config.yaml')
+try:
+    with open(config_path, 'r') as file:
+        config_data = yaml.safe_load(file)
+    config = Config(**config_data)
+except ValidationError as e:
+    print(f"Configuration validation error: {e}")
+    sys.exit(1)
+except FileNotFoundError:
+    print(f"Configuration file not found at {config_path}")
+    sys.exit(1)
+
+# Setup Logging with Structured JSON Logging
+logger = setup_logging(config.log_dir, config.debug_mode)
+
+# Apply fallback for essential directories
+config.log_dir = ensure_directory(config.log_dir, 'logs')
+config.screenshot_dir = ensure_directory(config.screenshot_dir, 'screenshots')
+config.archive_dir = ensure_directory(config.archive_dir, 'archive')
+
+# FTP and Pushover Credentials (Loaded from .env)
+# FTP credentials
+ftp_host = os.getenv('FTP_HOST')
+ftp_user = os.getenv('FTP_USER')
+ftp_pass = os.getenv('FTP_PASS')
+ftp_port = int(os.getenv('FTP_PORT', 21))  # Default FTP port is 21
+
+# Pushover setup
+pushover_user_key = os.getenv('PUSHOVER_USER_KEY')
+pushover_token = os.getenv('PUSHOVER_TOKEN')
+
+# Base URL for accessing the uploaded image
+base_url = os.getenv('BASE_URL', 'http://example.com/')  # Default base URL
+
+# Resource usage deques with maximum lengths to limit memory usage
+cpu_usages = deque(maxlen=720)      # Assuming sampling every 5 seconds for 1 hour
+ram_usages = deque(maxlen=720)
+disk_read_bytes = deque(maxlen=720)
+disk_write_bytes = deque(maxlen=720)
+net_sent_bytes = deque(maxlen=720)
+net_recv_bytes = deque(maxlen=720)
+
+# Shutdown event for graceful shutdown
+shutdown_event = threading.Event()
+
+# Resource monitor event
+resource_monitor_event = threading.Event()
+
+# Flag to indicate if a shutdown signal was received
+shutdown_signal_received = False
+
+# Variables for execution statistics
+successful_sites = []
+failed_sites = {}
+
+# Last notification time for throttling
+last_notification_time = None
+
+# Initialize combined_image_path as None
+combined_image_path = None
+
+# =============================================================================
+# Register Signal Handlers and Start the Script
+# =============================================================================
+
 if __name__ == "__main__":
-    # =============================================================================
-    # Load Configuration and Environment Variables
-    # =============================================================================
-
-    # Get the directory where the script is located
-    script_dir = get_script_directory()
-
-    # Load environment variables from .env file
-    dotenv_path = os.path.join(script_dir, '.env')
-    load_dotenv(dotenv_path)
-
-    # Load configuration from config.yaml
-    config_path = os.path.join(script_dir, 'config.yaml')
-    try:
-        with open(config_path, 'r') as file:
-            config_data = yaml.safe_load(file)
-        config = Config(**config_data)
-    except ValidationError as e:
-        print(f"Configuration validation error: {e}")
-        sys.exit(1)
-    except FileNotFoundError:
-        print(f"Configuration file not found at {config_path}")
-        sys.exit(1)
-
-    # =============================================================================
-    # Setup Logging with Structured JSON Logging
-    # =============================================================================
-
-    logger = setup_logging(config.log_dir, config.debug_mode)
-
-    # =============================================================================
-    # Directory Fallback Handling
-    # =============================================================================
-
-    config.log_dir = ensure_directory(config.log_dir, 'logs')
-    config.screenshot_dir = ensure_directory(config.screenshot_dir, 'screenshots')
-    config.archive_dir = ensure_directory(config.archive_dir, 'archive')
-
-    # =============================================================================
-    # FTP and Pushover Credentials (Loaded from .env)
-    # =============================================================================
-
-    # FTP credentials
-    ftp_host = os.getenv('FTP_HOST')
-    ftp_user = os.getenv('FTP_USER')
-    ftp_pass = os.getenv('FTP_PASS')
-    ftp_port = int(os.getenv('FTP_PORT', 21))  # Default FTP port is 21
-
-    # Pushover setup
-    pushover_user_key = os.getenv('PUSHOVER_USER_KEY')
-    pushover_token = os.getenv('PUSHOVER_TOKEN')
-
-    # Base URL for accessing the uploaded image
-    base_url = os.getenv('BASE_URL', 'http://example.com/')  # Default base URL
-
-    # =============================================================================
-    # Global Variables for Resource Monitoring and Shutdown
-    # =============================================================================
-
-    # Resource usage deques with maximum lengths to limit memory usage
-    cpu_usages = deque(maxlen=720)      # Assuming sampling every 5 seconds for 1 hour
-    ram_usages = deque(maxlen=720)
-    disk_read_bytes = deque(maxlen=720)
-    disk_write_bytes = deque(maxlen=720)
-    net_sent_bytes = deque(maxlen=720)
-    net_recv_bytes = deque(maxlen=720)
-
-    # Shutdown event for graceful shutdown
-    shutdown_event = threading.Event()
-
-    # Resource monitor event
-    resource_monitor_event = threading.Event()
-
-    # Flag to indicate if a shutdown signal was received
-    shutdown_signal_received = False
-
-    # Variables for execution statistics
-    successful_sites = []
-    failed_sites = {}
-
-    # Last notification time for throttling
-    last_notification_time = None
-
-    # Initialize combined_image_path as None
-    combined_image_path = None
-
     try:
         main()
     except KeyboardInterrupt:
