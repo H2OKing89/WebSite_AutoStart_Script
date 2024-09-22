@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Script Name: Website Screenshot Taker
-Version: 1.2.1
+Version: 1.2.2
 Author: Quentin King
 Date: 09-21-2024
 
@@ -11,27 +11,41 @@ This script automates the process of taking screenshots of specified websites us
 combines the screenshots into a grid image, uploads the image to an FTP server, and sends notifications
 via Pushover. It includes robust error handling, resource monitoring, and a graceful shutdown mechanism.
 Additionally, it automates the ChromeDriver update process to ensure compatibility with the installed Chrome browser.
+
+Enhancements:
+- Type hinting for static type checking.
+- Validation of configuration files.
+- Enhanced logging with contextual information.
+- Retry logic with exponential backoff for network calls.
+- Timeouts for WebDriver operations.
+- Context managers for resource management.
+- Signal handling for additional signals (`SIGHUP`, `SIGQUIT`).
+- Validation of environment variables.
+- Graceful degradation.
 """
 
 import os
 import shutil
 import time
+import re
 import requests
 import zipfile
 import threading
 import functools
 import signal
-import re
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import ftplib
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import WebDriverException, TimeoutException, SessionNotCreatedException
+from selenium.common.exceptions import (
+    WebDriverException,
+    TimeoutException,
+    SessionNotCreatedException,
+)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
 from dotenv import load_dotenv
 import yaml
 from tqdm import tqdm
@@ -40,7 +54,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pythonjsonlogger import jsonlogger
 from pydantic import BaseModel, ValidationError, field_validator
-from bs4 import BeautifulSoup
+from typing import Optional, Tuple, Dict, List, Any, Callable
 
 # =============================================================================
 # Configuration Validation using Pydantic V2
@@ -52,21 +66,21 @@ class Config(BaseModel):
     screenshot_dir: str
     archive_dir: str
     driver_dir: str  # Directory to store ChromeDriver
-    websites: list
-    grid_size: dict
+    websites: List[str]
+    grid_size: Dict[str, int]
     profile_path: str
     headless: bool = True
-    window_size: dict
+    window_size: Dict[str, int]
     max_workers: int = 5
 
     @field_validator('grid_size')
-    def check_grid_size(cls, v):
+    def check_grid_size(cls, v: Dict[str, int]) -> Dict[str, int]:
         if 'rows' not in v or 'columns' not in v:
             raise ValueError("Grid size must include 'rows' and 'columns'")
         return v
 
     @field_validator('window_size')
-    def check_window_size(cls, v):
+    def check_window_size(cls, v: Dict[str, int]) -> Dict[str, int]:
         if 'width' not in v or 'height' not in v:
             raise ValueError("Window size must include 'width' and 'height'")
         return v
@@ -96,12 +110,12 @@ except FileNotFoundError:
     exit(1)
 
 # Assign non-sensitive configurations
-websites = config.websites
-grid_size = (
+websites: List[str] = config.websites
+grid_size: Tuple[int, int] = (
     config.grid_size.get('rows', 3),
     config.grid_size.get('columns', 5),
 )
-window_size = (
+window_size: Tuple[int, int] = (
     config.window_size.get('width', 1920),
     config.window_size.get('height', 1080),
 )
@@ -113,7 +127,7 @@ os.makedirs(config.archive_dir, exist_ok=True)
 os.makedirs(config.driver_dir, exist_ok=True)  # Ensure driver directory exists
 
 # =============================================================================
-# Setup Logging with Structured JSON Logging
+# Setup Logging with Contextual Information and Structured JSON Logging
 # =============================================================================
 
 log_file = os.path.join(config.log_dir, 'website_refresh_log.json')
@@ -125,14 +139,18 @@ logger.setLevel(logging.DEBUG if config.debug_mode else logging.INFO)
 # Rotating file handler with JSON formatter
 file_handler = RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=5)
 file_handler.setLevel(logging.DEBUG if config.debug_mode else logging.INFO)
-file_formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(message)s')
+file_formatter = jsonlogger.JsonFormatter(
+    '%(asctime)s %(levelname)s %(message)s %(funcName)s %(lineno)d'
+)
 file_handler.setFormatter(file_formatter)
 logger.addHandler(file_handler)
 
 # Console handler with simple formatter
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.DEBUG if config.debug_mode else logging.INFO)
-console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+console_formatter = logging.Formatter(
+    '%(asctime)s - %(levelname)s - %(message)s - %(funcName)s - Line: %(lineno)d'
+)
 console_handler.setFormatter(console_formatter)
 logger.addHandler(console_handler)
 
@@ -150,21 +168,31 @@ logger.info("Script started successfully!")
 # =============================================================================
 
 # FTP credentials
-ftp_host = os.getenv('FTP_HOST')
-ftp_user = os.getenv('FTP_USER')
-ftp_pass = os.getenv('FTP_PASS')
-ftp_port = int(os.getenv('FTP_PORT', 21))  # Default FTP port is 21
+ftp_host: Optional[str] = os.getenv('FTP_HOST')
+ftp_user: Optional[str] = os.getenv('FTP_USER')
+ftp_pass: Optional[str] = os.getenv('FTP_PASS')
+ftp_port: int = int(os.getenv('FTP_PORT', 21))  # Default FTP port is 21
 
 # Pushover setup
-pushover_user_key = os.getenv('PUSHOVER_USER_KEY')
-pushover_token = os.getenv('PUSHOVER_TOKEN')
+pushover_user_key: Optional[str] = os.getenv('PUSHOVER_USER_KEY')
+pushover_token: Optional[str] = os.getenv('PUSHOVER_TOKEN')
 
 # Base URL for accessing the uploaded image
-base_url = os.getenv('BASE_URL', '').rstrip('/') + '/'
+base_url: str = os.getenv('BASE_URL', '').rstrip('/') + '/'
 
-# Check if all required environment variables are set
-if not all([ftp_host, ftp_user, ftp_pass, pushover_user_key, pushover_token, base_url]):
-    logger.error("One or more environment variables are missing. Please check your .env file.")
+# Validate environment variables
+required_env_vars = {
+    'FTP_HOST': ftp_host,
+    'FTP_USER': ftp_user,
+    'FTP_PASS': ftp_pass,
+    'PUSHOVER_USER_KEY': pushover_user_key,
+    'PUSHOVER_TOKEN': pushover_token,
+    'BASE_URL': base_url,
+}
+
+missing_env_vars = [key for key, value in required_env_vars.items() if not value]
+if missing_env_vars:
+    logger.error(f"Missing environment variables: {', '.join(missing_env_vars)}")
     exit(1)
 
 # =============================================================================
@@ -172,12 +200,12 @@ if not all([ftp_host, ftp_user, ftp_pass, pushover_user_key, pushover_token, bas
 # =============================================================================
 
 # Resource usage lists
-cpu_usages = []
-ram_usages = []
-disk_read_bytes = []
-disk_write_bytes = []
-net_sent_bytes = []
-net_recv_bytes = []
+cpu_usages: List[float] = []
+ram_usages: List[float] = []
+disk_read_bytes: List[int] = []
+disk_write_bytes: List[int] = []
+net_sent_bytes: List[int] = []
+net_recv_bytes: List[int] = []
 
 # Shutdown event for graceful shutdown
 shutdown_event = threading.Event()
@@ -186,26 +214,36 @@ shutdown_event = threading.Event()
 resource_monitor_event = threading.Event()
 
 # Flag to indicate if a shutdown signal was received
-shutdown_signal_received = False
+shutdown_signal_received: bool = False
 
 # Variables for execution statistics
-successful_sites = []
-failed_sites = {}
+successful_sites: List[str] = []
+failed_sites: Dict[str, str] = {}
 
 # Last notification time for throttling
-last_notification_time = None
+last_notification_time: Optional[datetime] = None
 
 # Initialize combined_image_path as None
-combined_image_path = None
+combined_image_path: Optional[str] = None
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
 
-def send_pushover_notification(start_time, end_time, total_time, avg_cpu_usage, avg_ram_usage,
-                               combined_image_url, total_disk_read, total_disk_write,
-                               total_net_sent, total_net_recv,
-                               error_occurred=False, error_details=None):
+def send_pushover_notification(
+    start_time: datetime,
+    end_time: datetime,
+    total_time: timedelta,
+    avg_cpu_usage: float,
+    avg_ram_usage: float,
+    combined_image_url: Optional[str],
+    total_disk_read: int,
+    total_disk_write: int,
+    total_net_sent: int,
+    total_net_recv: int,
+    error_occurred: bool = False,
+    error_details: Optional[str] = None
+) -> None:
     """
     Send a notification via Pushover with the script's results, including detailed information.
     """
@@ -295,17 +333,22 @@ def send_pushover_notification(start_time, end_time, total_time, avg_cpu_usage, 
 
     logger.info("Sending Pushover notification...")
 
-    # Send the notification
+    # Send the notification with retry logic
     try:
-        response = requests.post("https://api.pushover.net/1/messages.json", data=payload)
-        if response.status_code == 200:
-            logger.info("Pushover notification sent successfully!")
-        else:
-            logger.error(f"Pushover failed. Status code: {response.status_code}, Response: {response.text}")
+        send_with_retry(
+            func=requests.post,
+            url="https://api.pushover.net/1/messages.json",
+            data=payload,
+            exceptions=(requests.RequestException,),
+            total_tries=3,
+            initial_wait=2,
+            backoff_factor=2,
+        )
+        logger.info("Pushover notification sent successfully!")
     except Exception as e:
         logger.error(f"Error sending Pushover notification: {e}", exc_info=True)
 
-def calculate_resource_usage():
+def calculate_resource_usage() -> Tuple[float, float, psutil._common.sdiskio, psutil._common.snetio]:
     """
     Calculate CPU, RAM, Disk I/O, and Network usage.
 
@@ -318,7 +361,7 @@ def calculate_resource_usage():
     net_io = psutil.net_io_counters()
     return cpu_usage, ram_usage, disk_io, net_io
 
-def monitor_resources():
+def monitor_resources() -> None:
     """
     Monitor resource usage over time.
     """
@@ -333,7 +376,12 @@ def monitor_resources():
         time.sleep(5)
     logger.info("Resource monitor thread exiting due to resource_monitor_event.")
 
-def retry(exceptions, total_tries=4, initial_wait=0.5, backoff_factor=2):
+def retry(
+    exceptions: Tuple[Exception, ...],
+    total_tries: int = 4,
+    initial_wait: float = 0.5,
+    backoff_factor: int = 2
+) -> Callable:
     """
     Decorator for retrying a function with exponential backoff.
 
@@ -346,9 +394,9 @@ def retry(exceptions, total_tries=4, initial_wait=0.5, backoff_factor=2):
     Returns:
         function: Wrapped function with retry logic.
     """
-    def decorator_retry(func):
+    def decorator_retry(func: Callable) -> Callable:
         @functools.wraps(func)
-        def wrapper_retry(*args, **kwargs):
+        def wrapper_retry(*args: Any, **kwargs: Any) -> Any:
             _tries, _delay = total_tries, initial_wait
             while _tries > 1:
                 try:
@@ -366,7 +414,44 @@ def retry(exceptions, total_tries=4, initial_wait=0.5, backoff_factor=2):
         return wrapper_retry
     return decorator_retry
 
-def add_timestamp_to_image(image_path):
+def send_with_retry(
+    func: Callable,
+    *args: Any,
+    exceptions: Tuple[Exception, ...],
+    total_tries: int = 3,
+    initial_wait: float = 2,
+    backoff_factor: int = 2,
+    **kwargs: Any
+) -> Any:
+    """
+    Send a request with retry logic.
+
+    Parameters:
+        func (Callable): The function to execute.
+        exceptions (tuple): Exceptions to catch.
+        total_tries (int): Total number of attempts.
+        initial_wait (float): Initial wait time in seconds.
+        backoff_factor (int): Multiplier for exponential backoff.
+
+    Returns:
+        Any: The result of the function call.
+    """
+    _tries, _delay = total_tries, initial_wait
+    while _tries > 1:
+        try:
+            return func(*args, **kwargs)
+        except exceptions as e:
+            if shutdown_event.is_set():
+                logger.info(f"Shutdown event detected during retries. Exiting {func.__name__}.")
+                raise e
+            msg = f"{func.__name__} failed with {e}, retrying in {_delay} seconds..."
+            logger.warning(msg)
+            time.sleep(_delay)
+            _tries -= 1
+            _delay *= backoff_factor
+    return func(*args, **kwargs)
+
+def add_timestamp_to_image(image_path: str) -> None:
     """
     Add a timestamp watermark to the image.
 
@@ -400,10 +485,10 @@ def add_timestamp_to_image(image_path):
         combined = combined.convert('RGB')  # Convert back to RGB
         combined.save(image_path, format='PNG', optimize=True)
         logger.info(f"Timestamp added to image: {image_path}")
-    except Exception as e:
+    except (UnidentifiedImageError, Exception) as e:
         logger.error(f"Failed to add timestamp to image {image_path}: {e}", exc_info=True)
 
-def get_latest_stable_chromedriver_version():
+def get_latest_stable_chromedriver_version() -> Optional[str]:
     """
     Get the latest stable ChromeDriver version.
 
@@ -411,7 +496,10 @@ def get_latest_stable_chromedriver_version():
         str: Latest stable ChromeDriver version (e.g., "129.0.6668.58") or None if failed.
     """
     try:
-        response = requests.get("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json", timeout=10)
+        response = requests.get(
+            "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
+            timeout=10
+        )
         response.raise_for_status()
         data = response.json()
         stable_version = data.get('channels', {}).get('Stable', {}).get('version')
@@ -423,7 +511,7 @@ def get_latest_stable_chromedriver_version():
         logger.error(f"Error while fetching ChromeDriver version: {e}", exc_info=True)
     return None
 
-def download_and_extract_chromedriver(version, destination):
+def download_and_extract_chromedriver(version: str, destination: str) -> bool:
     """
     Download and extract ChromeDriver from the constructed URL.
 
@@ -460,7 +548,7 @@ def download_and_extract_chromedriver(version, destination):
         logger.error(f"Failed to download or extract ChromeDriver: {e}", exc_info=True)
         return False
 
-def check_chromedriver():
+def check_chromedriver() -> bool:
     """
     Check if ChromeDriver is compatible with Chrome.
 
@@ -476,8 +564,13 @@ def check_chromedriver():
         return False
     return True
 
-@retry((WebDriverException, SessionNotCreatedException, TimeoutException, ValueError), total_tries=4, initial_wait=2, backoff_factor=2)
-def initialize_webdriver():
+@retry(
+    (WebDriverException, SessionNotCreatedException, TimeoutException, ValueError),
+    total_tries=4,
+    initial_wait=2,
+    backoff_factor=2
+)
+def initialize_webdriver() -> webdriver.Chrome:
     """
     Initialize the Selenium WebDriver with options. If initialization fails due to ChromeDriver issues,
     attempt to update the ChromeDriver and retry.
@@ -489,23 +582,23 @@ def initialize_webdriver():
         logger.info("Shutdown event detected. Skipping WebDriver initialization.")
         raise Exception("Shutdown event detected.")
 
-    optionsVar = webdriver.ChromeOptions()
-    ProfilePath = config.profile_path
-    optionsVar.add_argument(r"--user-data-dir=" + ProfilePath)
-    optionsVar.add_argument(r'--profile-directory=Default')
+    options_var = webdriver.ChromeOptions()
+    profile_path = config.profile_path
+    options_var.add_argument(r"--user-data-dir=" + profile_path)
+    options_var.add_argument(r'--profile-directory=Default')
     if config.headless:
-        optionsVar.add_argument('--headless')
-        optionsVar.add_argument('--disable-gpu')
+        options_var.add_argument('--headless')
+        options_var.add_argument('--disable-gpu')
 
     # Set consistent window size
-    optionsVar.add_argument(f'--window-size={window_size[0]},{window_size[1]}')
+    options_var.add_argument(f'--window-size={window_size[0]},{window_size[1]}')
 
     # Additional options for headless operation
-    optionsVar.add_argument('--no-sandbox')
-    optionsVar.add_argument('--disable-dev-shm-usage')
+    options_var.add_argument('--no-sandbox')
+    options_var.add_argument('--disable-dev-shm-usage')
 
     # Set page load strategy to 'normal' to wait for all resources
-    optionsVar.page_load_strategy = 'normal'
+    options_var.page_load_strategy = 'normal'
 
     chromedriver_path = os.path.join(config.driver_dir, "chromedriver.exe")
 
@@ -521,7 +614,7 @@ def initialize_webdriver():
                 raise Exception("Could not retrieve the latest ChromeDriver version.")
 
         # Attempt to initialize WebDriver
-        driver = webdriver.Chrome(service=Service(chromedriver_path), options=optionsVar)
+        driver = webdriver.Chrome(service=Service(chromedriver_path), options=options_var)
         logger.info("WebDriver initialized successfully.")
         return driver
     except (WebDriverException, SessionNotCreatedException, TimeoutException, ValueError) as e:
@@ -538,7 +631,7 @@ def initialize_webdriver():
             if download_success:
                 # Step 3: Retry initializing WebDriver with the new driver
                 try:
-                    driver = webdriver.Chrome(service=Service(chromedriver_path), options=optionsVar)
+                    driver = webdriver.Chrome(service=Service(chromedriver_path), options=options_var)
                     logger.info("WebDriver initialized successfully with the updated ChromeDriver.")
                     return driver
                 except Exception as retry_e:
@@ -549,7 +642,7 @@ def initialize_webdriver():
         # If all attempts fail, raise the exception to be handled in main
         raise e
 
-def archive_old_screenshots():
+def archive_old_screenshots() -> None:
     """
     Archive old screenshots and clean up old archives.
     """
@@ -561,7 +654,10 @@ def archive_old_screenshots():
         # Move existing screenshots to archive
         for filename in os.listdir(config.screenshot_dir):
             if filename.endswith('.png'):
-                shutil.move(os.path.join(config.screenshot_dir, filename), os.path.join(archive_subdir, filename))
+                shutil.move(
+                    os.path.join(config.screenshot_dir, filename),
+                    os.path.join(archive_subdir, filename)
+                )
         logger.info(f"Old screenshots moved to {archive_subdir}")
 
         # Cleanup old archives, keep only the 5 most recent
@@ -575,8 +671,13 @@ def archive_old_screenshots():
     except Exception as e:
         logger.error(f"Failed to archive old screenshots: {e}", exc_info=True)
 
-@retry((Exception,), total_tries=3, initial_wait=2, backoff_factor=2)
-def upload_to_ftp(file_path):
+@retry(
+    (Exception,),
+    total_tries=3,
+    initial_wait=2,
+    backoff_factor=2
+)
+def upload_to_ftp(file_path: str) -> bool:
     """
     Upload the combined image to the FTP server.
 
@@ -589,8 +690,9 @@ def upload_to_ftp(file_path):
     if shutdown_signal_received:
         logger.info("Shutdown signal received. Skipping FTP upload.")
         raise Exception("Shutdown event detected.")
+
     try:
-        with ftplib.FTP() as ftp:
+        with ftplib.FTP(timeout=30) as ftp:
             ftp.connect(ftp_host, ftp_port)
             ftp.login(ftp_user, ftp_pass)
             ftp.set_pasv(True)  # Enable passive mode
@@ -622,7 +724,7 @@ def upload_to_ftp(file_path):
         logger.error(f"FTP upload failed: {e}", exc_info=True)
         raise e
 
-def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
+def combine_images_into_grid(screenshot_dir: str, grid_size: Tuple[int, int]) -> Optional[str]:
     """
     Combine screenshots into a grid image.
 
@@ -675,7 +777,7 @@ def combine_images_into_grid(screenshot_dir, grid_size=(3, 5)):
         logger.error(f"Failed to combine images into grid: {e}", exc_info=True)
         return None
 
-def clean_temporary_files():
+def clean_temporary_files() -> None:
     """
     Clean up local temporary files.
     """
@@ -686,7 +788,7 @@ def clean_temporary_files():
     except Exception as e:
         logger.error(f"Failed to clean temporary files: {e}", exc_info=True)
 
-def handle_shutdown_signal(signum, frame):
+def handle_shutdown_signal(signum: int, frame: Any) -> None:
     """
     Handle shutdown signals to initiate graceful shutdown.
 
@@ -704,7 +806,20 @@ def handle_shutdown_signal(signum, frame):
 signal.signal(signal.SIGINT, handle_shutdown_signal)   # Handle Ctrl+C
 signal.signal(signal.SIGTERM, handle_shutdown_signal)  # Handle termination signal
 
-def process_site(driver, site, start_time):
+# Handle additional signals only if they are available on the platform
+if hasattr(signal, 'SIGHUP'):
+    try:
+        signal.signal(signal.SIGHUP, handle_shutdown_signal)   # Handle hangup signal
+    except (AttributeError, ValueError) as e:
+        logger.warning(f"Unable to register SIGHUP handler: {e}")
+
+if hasattr(signal, 'SIGQUIT'):
+    try:
+        signal.signal(signal.SIGQUIT, handle_shutdown_signal)  # Handle quit signal
+    except (AttributeError, ValueError) as e:
+        logger.warning(f"Unable to register SIGQUIT handler: {e}")
+
+def process_site(driver: webdriver.Chrome, site: str, start_time: datetime) -> None:
     """
     Process a single website.
 
@@ -740,7 +855,7 @@ def process_site(driver, site, start_time):
         if not shutdown_event.is_set():
             time.sleep(random.uniform(1, 3))
 
-def load_website_with_retry(driver, site, timeout=60):
+def load_website_with_retry(driver: webdriver.Chrome, site: str, timeout: int = 60) -> bool:
     """
     Attempt to load a website with retries.
 
@@ -753,6 +868,7 @@ def load_website_with_retry(driver, site, timeout=60):
         bool: True if website loaded successfully, False otherwise.
     """
     try:
+        driver.set_page_load_timeout(timeout)
         driver.get(site)
         if not wait_for_page_load(driver, timeout=timeout):
             return False
@@ -761,7 +877,7 @@ def load_website_with_retry(driver, site, timeout=60):
         logger.error(f"Error loading website {site}: {e}", exc_info=True)
         return False
 
-def wait_for_page_load(driver, timeout=60):
+def wait_for_page_load(driver: webdriver.Chrome, timeout: int = 60) -> bool:
     """
     Wait for the page to load completely.
 
@@ -782,7 +898,7 @@ def wait_for_page_load(driver, timeout=60):
         return False
     return True
 
-def take_fullpage_screenshot(driver, site_name, status):
+def take_fullpage_screenshot(driver: webdriver.Chrome, site_name: str, status: str) -> str:
     """
     Take a screenshot of the current page with metadata.
 
@@ -798,8 +914,7 @@ def take_fullpage_screenshot(driver, site_name, status):
         logger.info("Shutdown event detected. Skipping screenshot.")
         raise Exception("Shutdown event detected.")
     try:
-        site_name_clean = site_name.replace("https://", "").replace("http://", "").replace("/", "") \
-                                   .replace(".", "_").replace(":", "")
+        site_name_clean = re.sub(r'[^A-Za-z0-9]', '_', site_name.replace("https://", "").replace("http://", ""))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         screenshot_name = f"{site_name_clean}_{timestamp}_{status}.png"
         screenshot_path = os.path.join(config.screenshot_dir, screenshot_name)
@@ -819,11 +934,11 @@ def take_fullpage_screenshot(driver, site_name, status):
         logger.error(f"Failed to take screenshot for {site_name}: {e}", exc_info=True)
         raise e
 
-def main():
+def main() -> None:
     """
     Main function to execute the script.
     """
-    global start_time, combined_image_path
+    global combined_image_path
 
     start_time = datetime.now()
     logger.info(f"Script started at {start_time}")
@@ -839,9 +954,9 @@ def main():
     resource_thread = threading.Thread(target=monitor_resources)
     resource_thread.start()
 
-    driver = None  # Initialize driver variable
-    error_occurred = False  # Flag to indicate if any errors occurred
-    error_details = None
+    driver: Optional[webdriver.Chrome] = None  # Initialize driver variable
+    error_occurred: bool = False  # Flag to indicate if any errors occurred
+    error_details: Optional[str] = None
 
     try:
         driver = initialize_webdriver()
@@ -886,7 +1001,7 @@ def main():
         total_net_sent = final_net_io.bytes_sent - initial_net_io.bytes_sent
         total_net_recv = final_net_io.bytes_recv - initial_net_io.bytes_recv
 
-        combined_image_url = None
+        combined_image_url: Optional[str] = None
 
         if not shutdown_signal_received and not error_occurred:
             # Combine screenshots into a grid
@@ -895,7 +1010,14 @@ def main():
             if combined_image_path:
                 # Upload the combined image to FTP
                 try:
-                    upload_success = upload_to_ftp(combined_image_path)
+                    upload_success = send_with_retry(
+                        func=upload_to_ftp,
+                        file_path=combined_image_path,
+                        exceptions=(Exception,),
+                        total_tries=3,
+                        initial_wait=2,
+                        backoff_factor=2,
+                    )
                     if upload_success:
                         # Construct the URL to access the image
                         combined_image_url = f"{base_url}{os.path.basename(combined_image_path)}"
