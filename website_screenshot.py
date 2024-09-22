@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Script Name: Website Screenshot Taker
-Version: 1.2.2
+Version: 1.2.3
 Author: Quentin King
-Date: 09-21-2024
+Date: 09-22-2024
 
 Description:
 This script automates the process of taking screenshots of specified websites using Selenium WebDriver,
@@ -22,6 +22,7 @@ Enhancements:
 - Signal handling for additional signals (`SIGHUP`, `SIGQUIT`).
 - Validation of environment variables.
 - Graceful degradation.
+- **New Feature**: Checks if Chrome is running at the start and shuts it down if necessary.
 """
 
 import os
@@ -55,6 +56,10 @@ from logging.handlers import RotatingFileHandler
 from pythonjsonlogger import jsonlogger
 from pydantic import BaseModel, ValidationError, field_validator
 from typing import Optional, Tuple, Dict, List, Any, Callable
+import signal
+import psutil
+import os
+import signal
 
 # =============================================================================
 # Configuration Validation using Pydantic V2
@@ -162,6 +167,49 @@ logging.getLogger('ftplib').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
 logger.info("Script started successfully!")
+
+# =============================================================================
+# New Feature: Check if Chrome is Open and Shut It Down if Necessary
+# =============================================================================
+
+def is_chrome_open() -> bool:
+    """
+    Check if Chrome browser is open by scanning for any running 'chrome' processes.
+
+    Returns:
+        bool: True if Chrome is running, False otherwise.
+    """
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            if 'chrome' in proc.info['name'].lower():
+                return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking Chrome processes: {e}", exc_info=True)
+        return False
+
+def shut_down_chrome() -> None:
+    """
+    Shut down all instances of the Chrome browser.
+    """
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            if 'chrome' in proc.info['name'].lower():
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                    logger.info(f"Terminated Chrome process with PID: {proc.info['pid']}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired) as e:
+                    logger.warning(f"Failed to terminate Chrome process PID {proc.info['pid']}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error while shutting down Chrome: {e}", exc_info=True)
+
+# Check if Chrome is open and shut it down if necessary
+if is_chrome_open():
+    logger.info("Chrome is currently open. Shutting it down...")
+    shut_down_chrome()
+else:
+    logger.info("Chrome is not running. Proceeding with the script...")
 
 # =============================================================================
 # FTP and Pushover Credentials (Loaded from .env)
@@ -522,6 +570,7 @@ def download_and_extract_chromedriver(version: str, destination: str) -> bool:
     Returns:
         bool: True if download and extraction succeeded, False otherwise.
     """
+    # Adjust the download URL based on your OS if necessary
     base_download_url = f"https://edgedl.me.gvt1.com/edgedl/chrome/chrome-for-testing/{version}/win64/chromedriver-win64.zip"
     zip_path = os.path.join(destination, "chromedriver.zip")
 
