@@ -142,6 +142,7 @@ venv.bak/
 run_screenshot_script.bat
 config.yaml
 logs/
+screenshots/
 ######################
 
 # mypy
